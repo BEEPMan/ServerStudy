@@ -36,8 +36,8 @@ enum ePKCMD
 #pragma pack(push, 1)
 struct pkHead
 {
-	char cmd;
 	WORD dataSize;
+	DWORD cmd;
 };
 struct st_packet
 {
@@ -145,7 +145,7 @@ int main()
 		WSACleanup();
 		return 1;
 	}
-	int nagleOption = TRUE;
+	int nagleOption = FALSE;
 	setsockopt(listenSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nagleOption, sizeof(nagleOption));
 
 	SOCKADDR_IN serverAddr;
@@ -212,17 +212,19 @@ void acceptThread(SOCKET listenSocket, HANDLE* hIOCP)
 			return;
 		}
 
+		std::cout << "Accept Success" << std::endl;
+
 		CLIENT client;
 		client.socket = clientSocket;
 		client.id = userCount;
 
 		client.socketInfo = new SOCKETINFO;
-		memset((void*)&client.socketInfo, 0, sizeof(struct SOCKETINFO));
+		memset((void*)&client.socketInfo->overlapped, 0, sizeof(WSAOVERLAPPED));
+		client.socketInfo->dataBuffer.buf = client.socketInfo->buffer;
 		client.socketInfo->dataBuffer.len = MAX_BUFFER;
-		client.socketInfo->dataBuffer.buf = (char*)client.socketInfo->buffer;
 		client.socketInfo->op = eOP::opRECV;
 		flags = 0;
-		*hIOCP = CreateIoCompletionPort((HANDLE)clientSocket, *hIOCP, (ULONG_PTR)client.id, 0);
+		*hIOCP = CreateIoCompletionPort((HANDLE)clientSocket, *hIOCP, (ULONG_PTR)&client.id, 0);
 
 		clients.push_back(client);
 		userCount++;
@@ -246,7 +248,7 @@ void acceptThread(SOCKET listenSocket, HANDLE* hIOCP)
 void workerThread(HANDLE* hIOCP)
 {
 	DWORD transferBytes;
-	int id;
+	int* id;
 	DWORD flags;
 	SOCKETINFO* socketInfo;
 	CLIENT* cl;
@@ -254,14 +256,16 @@ void workerThread(HANDLE* hIOCP)
 
 	while (1)
 	{
-		if (GetQueuedCompletionStatus(*hIOCP, &transferBytes, (PULONG_PTR)id, (LPOVERLAPPED*)&socketInfo, INFINITE) == 0)
+		if (GetQueuedCompletionStatus(*hIOCP, &transferBytes, (PULONG_PTR)&id, (LPOVERLAPPED*)&socketInfo, INFINITE) == 0)
 		{
 			std::cout << "GQCS Error: " << GetLastError() << std::endl;
-			closesocket(clients[id].socket);
-			clients[id].connected = false;
+			closesocket(clients[*id].socket);
+			clients[*id].connected = false;
 			delete socketInfo;
 			return;
 		}
+
+		cl = &clients[*id];
 
 		switch (socketInfo->op)
 		{
@@ -269,6 +273,7 @@ void workerThread(HANDLE* hIOCP)
 		{
 			if (transferBytes == 0)
 			{
+				std::cout << cl->name << " Logout." << std::endl;
 				closesocket(cl->socket);
 			}
 			delete socketInfo;
@@ -276,10 +281,9 @@ void workerThread(HANDLE* hIOCP)
 		}
 		case eOP::opRECV:
 		{
-			cl = &clients[id];
-
 			if (transferBytes == 0)
 			{
+				std::cout << cl->name << " Logout." << std::endl;
 				closesocket(cl->socket);
 				delete socketInfo;
 			}
@@ -293,12 +297,13 @@ void workerThread(HANDLE* hIOCP)
 					dataSize = recvPacket->head.dataSize;
 					strcpy(cl->name, recvPacket->name);
 					cl->name[strlen(cl->name)] = NULL;
-					cl->x = 0;
-					cl->y = 0;
-					cl->z = 0;
+					cl->x = 5;
+					cl->y = 1.5;
+					cl->z = 7.9;
 					cl->connected = true;
-					sendLoginOKPacket(id, cl->x, cl->y, cl->z);
-					sendEnterPacket(id, cl->x, cl->y, cl->z, cl->name);
+					std::cout << recvPacket->name << " Login." << std::endl;
+					sendLoginOKPacket(*id, cl->x, cl->y, cl->z);
+					sendEnterPacket(*id, cl->x, cl->y, cl->z, cl->name);
 					break;
 				}
 				case csMOVE:
@@ -308,7 +313,7 @@ void workerThread(HANDLE* hIOCP)
 					cl->x = recvPacket->x;
 					cl->y = recvPacket->y;
 					cl->z = recvPacket->z;
-					sendMovePacket(id, cl->x, cl->y, cl->z);
+					sendMovePacket(*id, cl->x, cl->y, cl->z);
 					break;
 				}
 				case csMESSAGE:
@@ -316,23 +321,12 @@ void workerThread(HANDLE* hIOCP)
 					st_csMESSAGE* recvPacket = reinterpret_cast<st_csMESSAGE*>(socketInfo->buffer);
 					dataSize = recvPacket->head.dataSize;
 					std::cout << cl->name << ": " << recvPacket->message << std::endl;
-					sendMessagePacket(id, recvPacket->message);
+					sendMessagePacket(*id, recvPacket->message);
 					break;
 				}
 				default:
 
 					break;
-				}
-
-				for (auto& cls : clients)
-				{
-					if (WSASend(cls.socket, &(cl->socketInfo->dataBuffer), 1, NULL, 0, NULL, NULL) == SOCKET_ERROR)
-					{
-						if (WSAGetLastError() != WSA_IO_PENDING)
-						{
-							std::cout << "ERROR - Fail WSASend(error_code : " << WSAGetLastError() << std::endl;
-						}
-					}
 				}
 
 				cl->socketInfo->dataBuffer.len = MAX_BUFFER;
@@ -366,7 +360,7 @@ void sendEnterPacket(int userID, float x, float y, float z, char* name)
 
 	for (auto& cl : clients)
 	{
-		if (cl.id == userID)continue;
+		if (cl.id == userID || !cl.connected)continue;
 		sendPacket(cl.id, &packet);
 	}
 }
@@ -395,7 +389,7 @@ void sendLeavePacket(int userID)
 
 	for (auto& cl : clients)
 	{
-		if (cl.id == userID)continue;
+		if (cl.id == userID || !cl.connected)continue;
 		sendPacket(cl.id, &packet);
 	}
 }
@@ -413,7 +407,7 @@ void sendMovePacket(int userID, float x, float y, float z)
 
 	for (auto& cl : clients)
 	{
-		if (cl.id == userID)continue;
+		if (cl.id == userID || !cl.connected)continue;
 		sendPacket(cl.id, &packet);
 	}
 }
@@ -431,7 +425,7 @@ void sendMessagePacket(int userID, char* message)
 
 	for (auto& cl : clients)
 	{
-		if (cl.id == userID)continue;
+		if (cl.id == userID || !cl.connected)continue;
 		sendPacket(cl.id, &packet);
 	}
 }
@@ -447,7 +441,7 @@ void sendPacket(int userID, void* packet)
 	socketInfo->op = eOP::opSEND;
 	socketInfo->dataBuffer.buf = socketInfo->buffer;
 	socketInfo->dataBuffer.len = reinterpret_cast<st_packet*>(packet)->head.dataSize;
-	strcpy(socketInfo->buffer, buf);
+	memcpy(socketInfo->buffer, buf, socketInfo->dataBuffer.len);
 
 	if (WSASend(user->socket, &(socketInfo->dataBuffer), 1, NULL, 0, &(socketInfo->overlapped), NULL) == SOCKET_ERROR)
 	{
